@@ -1,0 +1,85 @@
+name: dispatch
+# 1) 手动触发：扫描仓库 -> 生成迁移计划 -> 每批建一个 Issue（有依赖的先挂 blocked）
+# 2) Issue 关闭时：检查被挡住的批次，依赖全部关闭就解锁成 ready-for-devin
+on:
+  workflow_dispatch:
+    inputs:
+      path:
+        description: "要扫描的 Python 2 代码目录"
+        default: "tests/fixtures/py2_shop"
+      max_risk:
+        description: "每批风险上限"
+        default: "20"
+  issues:
+    types: [closed]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  plan:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SCAN_PATH: ${{ inputs.path }}
+      MAX_RISK: ${{ inputs.max_risk }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Create one issue per batch
+        run: |
+          python - <<'EOF'
+          import os, subprocess
+          from legacy_lift.scanner import scan_repo
+          from legacy_lift.planner import plan
+          from legacy_lift.tasks import devin_prompt
+
+          def gh(*args):
+              return subprocess.run(["gh", *args], check=True, capture_output=True, text=True).stdout.strip()
+
+          for name, color in [("legacy-lift", "1d76db"), ("blocked", "b60205"), ("ready-for-devin", "0e8a16")]:
+              gh("label", "create", name, "--color", color, "--force")
+
+          reports = scan_repo(os.environ["SCAN_PATH"])
+          issue_of = {}
+          for b in plan(reports, int(os.environ["MAX_RISK"])):
+              deps = " ".join(f"#{issue_of[d]}" for d in sorted(b.depends_on))
+              body = f"<!-- legacy-lift batch {b.index} -->\nDepends on: {deps or 'none'}\n\n```\n{devin_prompt(b, reports)}```"
+              state = "blocked" if b.depends_on else "ready-for-devin"
+              url = gh("issue", "create", "--title", f"[Legacy Lift] Batch {b.index}: {', '.join(b.modules)}",
+                       "--body", body, "--label", "legacy-lift", "--label", state)
+              issue_of[b.index] = int(url.rstrip("/").rsplit("/", 1)[1])
+              print(f"batch {b.index} -> issue #{issue_of[b.index]} ({state})")
+          EOF
+
+  unlock:
+    if: github.event_name == 'issues' && contains(github.event.issue.labels.*.name, 'legacy-lift')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Unblock batches whose dependencies are all closed
+        run: |
+          python - <<'EOF'
+          import json, re, subprocess
+
+          def gh(*args):
+              return subprocess.run(["gh", *args], check=True, capture_output=True, text=True).stdout.strip()
+
+          blocked = json.loads(gh("issue", "list", "--label", "blocked", "--state", "open",
+                                  "--json", "number,body", "--limit", "500"))
+          for issue in blocked:
+              line = re.search(r"^Depends on: (.*)$", issue["body"], re.M)
+              deps = [int(n) for n in re.findall(r"#(\d+)", line.group(1))] if line else []
+              states = [json.loads(gh("issue", "view", str(d), "--json", "state"))["state"] for d in deps]
+              if all(s == "CLOSED" for s in states):
+                  n = str(issue["number"])
+                  gh("issue", "edit", n, "--remove-label", "blocked", "--add-label", "ready-for-devin")
+                  gh("issue", "comment", n, "--body", "All dependencies are merged. This batch is ready for Devin.")
+                  print(f"unblocked #{n}")
+          EOF
